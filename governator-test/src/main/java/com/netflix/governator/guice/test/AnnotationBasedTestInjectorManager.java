@@ -10,15 +10,18 @@ import java.util.Collections;
 import java.util.List;
 
 import javax.inject.Inject;
+import javax.inject.Singleton;
 
 import org.apache.commons.lang3.ClassUtils;
-import org.mockito.Mockito;
 
 import com.google.inject.AbstractModule;
 import com.google.inject.Binding;
 import com.google.inject.Injector;
 import com.google.inject.Key;
 import com.google.inject.Module;
+import com.google.inject.Provides;
+import com.google.inject.Stage;
+import com.google.inject.TypeLiteral;
 import com.google.inject.binder.AnnotatedBindingBuilder;
 import com.google.inject.binder.LinkedBindingBuilder;
 import com.google.inject.name.Names;
@@ -27,6 +30,7 @@ import com.google.inject.spi.Element;
 import com.google.inject.spi.Elements;
 import com.netflix.archaius.api.config.CompositeConfig;
 import com.netflix.archaius.api.config.SettableConfig;
+import com.netflix.archaius.api.inject.RuntimeLayer;
 import com.netflix.archaius.config.DefaultSettableConfig;
 import com.netflix.archaius.guice.Raw;
 import com.netflix.archaius.test.TestCompositeConfig;
@@ -34,11 +38,14 @@ import com.netflix.archaius.test.TestPropertyOverride;
 import com.netflix.archaius.test.TestPropertyOverrideAnnotationReader;
 import com.netflix.governator.InjectorBuilder;
 import com.netflix.governator.LifecycleInjector;
+import com.netflix.governator.guice.test.mocks.MockHandler;
 import com.netflix.governator.providers.SingletonProvider;
 
 public class AnnotationBasedTestInjectorManager {
 
-    private final LifecycleInjector injector;
+    private LifecycleInjector injector;
+    private final InjectorCreationMode injectorCreationMode;
+    private final MockHandler mockHandler;
     private final List<Object> mocksToReset = new ArrayList<>();
     private final List<Module> modulesForTestClass = new ArrayList<>();
     private final List<Module> overrideModules = new ArrayList<>();
@@ -48,34 +55,72 @@ public class AnnotationBasedTestInjectorManager {
     private final TestPropertyOverrideAnnotationReader testPropertyOverrideAnnotationReader = new TestPropertyOverrideAnnotationReader();
     private TestCompositeConfig testCompositeConfig;
 
-    public AnnotationBasedTestInjectorManager(Class<?> classUnderTest) {
+    public AnnotationBasedTestInjectorManager(Class<?> classUnderTest, Class<? extends MockHandler> defaultMockHandlerClass) {
+        this.injectorCreationMode = getInjectorCreationModeForAnnotatedClass(classUnderTest);
+        this.mockHandler = createMockHandlerForTestClass(classUnderTest, defaultMockHandlerClass);
         inspectModulesForTestClass(classUnderTest);
         inspectMocksForTestClass(classUnderTest);
-        inspectSpiesForTargetKeys(Elements.getElements(modulesForTestClass));
-        testCompositeConfig = new TestCompositeConfig(classLevelOverrides, methodLevelOverrides);
-        overrideModules.add(new ArchaiusTestConfigOverrideModule(testCompositeConfig));
-        injector = createInjector(modulesForTestClass, overrideModules);
+        inspectSpiesForTargetKeys(Elements.getElements(Stage.TOOL, modulesForTestClass));
+        overrideModules.add(new ArchaiusTestConfigOverrideModule(classLevelOverrides, methodLevelOverrides));
+    }
+
+    public void createInjector() {
+        this.injector = createInjector(modulesForTestClass, overrideModules);
+        this.testCompositeConfig = getInjector().getInstance(TestCompositeConfig.class);
     }
 
     /**
      * Injects dependencies into the provided test object.
      */
     public void prepareTestFixture(Object testFixture) {
-        injector.injectMembers(testFixture);
+        getInjector().injectMembers(testFixture);
     }
 
-    public void cleanupMocks() {
+    public void cleanUpMocks() {
         for (Object mock : mocksToReset) {
-            Mockito.reset(mock);
+            getMockHandler().resetMock(mock);
         }
     }
 
-    public void cleanupInjector() {
-        injector.close();
+    public void cleanUpMethodLevelConfig() {
+        testCompositeConfig.resetForTest();
+    }
+
+    public void cleanUpInjector() {
+        getInjector().close();
+    }
+
+    public InjectorCreationMode getInjectorCreationMode() {
+        return this.injectorCreationMode;
     }
 
     protected LifecycleInjector createInjector(List<Module> modules, List<Module> overrides) {
         return InjectorBuilder.fromModules(modules).overrideWith(overrides).createInjector();
+    }
+    
+    protected MockHandler createMockHandlerForTestClass(Class<?> testClass, Class<? extends MockHandler> defaultMockHandler) {
+        Class<? extends MockHandler> mockHandlerClass = defaultMockHandler;
+        for(Class<?> superClass : getAllSuperClassesInReverseOrder(testClass)) {
+            ModulesForTesting annotation = superClass.getAnnotation(ModulesForTesting.class);
+            if(annotation != null && !annotation.mockHandler().equals(MockHandler.class)) {
+                mockHandlerClass = annotation.mockHandler();
+            }
+        }
+        
+        ModulesForTesting annotation = testClass.getAnnotation(ModulesForTesting.class);
+        if(annotation != null && !annotation.mockHandler().equals(MockHandler.class)) {
+            mockHandlerClass = annotation.mockHandler();
+        }
+        
+        if (mockHandlerClass != null) {
+            try {
+                return mockHandlerClass != MockHandler.class ? mockHandlerClass.newInstance() : defaultMockHandler.newInstance();
+            } catch (SecurityException | InstantiationException | IllegalAccessException | IllegalArgumentException e) {
+               throw new IllegalArgumentException("Failed to instantiate MockHandler " + mockHandlerClass.getName() + ". Ensure that is has an accessible no-arg constructor.", e);
+            }
+        } else {
+            throw new IllegalStateException("No MockHandler specified!");
+        }
     }
 
     private void inspectModulesForTestClass(Class<?> testClass) {
@@ -90,9 +135,9 @@ public class AnnotationBasedTestInjectorManager {
                 modulesForTestClass.add(moduleClass.newInstance());
             } catch (InstantiationException | IllegalAccessException e) {
                 try {
-                    Constructor<?> constructor = moduleClass.getDeclaredConstructors()[0];
-                    constructor.setAccessible(true);
-                    modulesForTestClass.add((Module) constructor.newInstance());
+                    Constructor<?> zeroArgConstructor = moduleClass.getDeclaredConstructor();
+                    zeroArgConstructor.setAccessible(true);
+                    modulesForTestClass.add((Module) zeroArgConstructor.newInstance());
                 } catch (Exception ex) {
                     throw new RuntimeException("Error instantiating module " + moduleClass
                             + ". Please ensure that the module is public and has a no-arg constructor", e);
@@ -101,6 +146,15 @@ public class AnnotationBasedTestInjectorManager {
         }
     }
 
+    private InjectorCreationMode getInjectorCreationModeForAnnotatedClass(Class<?> testClass) {
+        final Annotation annotation = testClass.getAnnotation(ModulesForTesting.class);
+        if (annotation != null) {
+            return ((ModulesForTesting) annotation).injectorCreation();
+        } else {
+            return InjectorCreationMode.BEFORE_TEST_CLASS;
+        }
+    }
+    
     private List<Class<? extends Module>> getModulesForAnnotatedClass(Class<?> testClass) {
         final Annotation annotation = testClass.getAnnotation(ModulesForTesting.class);
         if (annotation != null) {
@@ -127,8 +181,7 @@ public class AnnotationBasedTestInjectorManager {
                 WrapWithSpy spyAnnotation = field.getAnnotation(WrapWithSpy.class);
                 if (spyAnnotation.name().isEmpty()) {
                     spyTargets.add(Key.get(field.getType()));
-                }
-                else {
+                } else {
                     spyTargets.add(Key.get(field.getType(), Names.named(spyAnnotation.name())));
                 }
             }
@@ -141,23 +194,26 @@ public class AnnotationBasedTestInjectorManager {
                 @Override
                 public <T> Void visit(Binding<T> binding) {
                     final Binding<T> finalBinding = binding;
+                    final Key<T> bindingKey = finalBinding.getKey();
+                    final TypeLiteral<T> bindingType = bindingKey.getTypeLiteral();
                     if (spyTargets.contains(binding.getKey())) {
                         AbstractModule spyModule = new AbstractModule() {
                             protected void configure() {
                                 final String finalBindingName = "Spied "
-                                        + (finalBinding.getKey().getAnnotation() != null
-                                                ? finalBinding.getKey().getAnnotation().toString() : "")
-                                        + finalBinding.getKey().getTypeLiteral();
-                                final Key<T> newUniqueKey = Key.get(finalBinding.getKey().getTypeLiteral(),
-                                        Names.named(finalBindingName));
+                                        + (bindingKey.getAnnotation() != null ? bindingKey.getAnnotation().toString() : "")
+                                        + bindingType;
+                                final Key<T> newUniqueKey = Key.get(bindingType, Names.named(finalBindingName));
                                 finalBinding.acceptTargetVisitor(new CopyBindingTargetVisitor<>(binder().bind(newUniqueKey)));
                                 bind(finalBinding.getKey()).toProvider(new SingletonProvider<T>() {
                                     @Inject
                                     Injector injector;
 
+                                    @Override
                                     protected T create() {
-                                        T t = (T) injector.getInstance(newUniqueKey);
-                                        return Mockito.spy(t);
+                                        T t = injector.getInstance(newUniqueKey);
+                                        T spied = getMockHandler().createSpy(t);
+                                        mocksToReset.add(spied);
+                                        return spied;
                                     };
                                 });
                             }
@@ -169,22 +225,31 @@ public class AnnotationBasedTestInjectorManager {
             });
         }
     }
-    
-    public void prepareConfigForTestClass(Class<?> testClass, Method testMethod) {
-        for(Class<?> parentClass : getAllSuperClassesInReverseOrder(testClass)) {
+
+    public void prepareConfigForTestClass(Class<?> testClass) {
+        for (Class<?> parentClass : getAllSuperClassesInReverseOrder(testClass)) {
             classLevelOverrides.setProperties(testPropertyOverrideAnnotationReader.getPropertiesForAnnotation(parentClass.getAnnotation(TestPropertyOverride.class)));
         }
         classLevelOverrides.setProperties(testPropertyOverrideAnnotationReader.getPropertiesForAnnotation(testClass.getAnnotation(TestPropertyOverride.class)));
-        methodLevelOverrides.setProperties(testPropertyOverrideAnnotationReader.getPropertiesForAnnotation(testMethod.getAnnotation(TestPropertyOverride.class)));                    
     }
-    
-    public void cleanUpMethodLevelConfig() {
-        testCompositeConfig.resetForTest();
+
+    public void prepareConfigForTestClass(Class<?> testClass, Method testMethod) {
+        prepareConfigForTestClass(testClass);
+        methodLevelOverrides.setProperties(testPropertyOverrideAnnotationReader.getPropertiesForAnnotation(testMethod.getAnnotation(TestPropertyOverride.class)));
     }
+
     private List<Class<?>> getAllSuperClassesInReverseOrder(Class<?> clazz) {
         List<Class<?>> allSuperclasses = ClassUtils.getAllSuperclasses(clazz);
         Collections.reverse(allSuperclasses);
         return allSuperclasses;
+    }
+
+    public MockHandler getMockHandler() {
+        return mockHandler;
+    }
+
+    public LifecycleInjector getInjector() {
+        return injector;
     }
 
     private class MockitoOverrideModule<T> extends AbstractModule {
@@ -198,7 +263,7 @@ public class AnnotationBasedTestInjectorManager {
 
         @Override
         protected void configure() {
-            final T mock = Mockito.mock(classToBind, annotation.answer().get());
+            final T mock = getMockHandler().createMock(classToBind, annotation.answer().get());
             mocksToReset.add(mock);
             LinkedBindingBuilder<T> bindingBuilder = bind(classToBind);
             if (!annotation.name().isEmpty()) {
@@ -207,17 +272,48 @@ public class AnnotationBasedTestInjectorManager {
             bindingBuilder.toInstance(mock);
         }
     }
-    
-    private class ArchaiusTestConfigOverrideModule extends AbstractModule {
-        private TestCompositeConfig config;
 
-        public ArchaiusTestConfigOverrideModule(TestCompositeConfig config) {
-            this.config = config;
+    private static class ArchaiusTestConfigOverrideModule extends AbstractModule {
+
+        private SettableConfig classLevelOverrides;
+        private SettableConfig methodLevelOverrides;
+
+        public ArchaiusTestConfigOverrideModule(SettableConfig classLevelOverrides, SettableConfig methodLevelOverrides) {
+            this.classLevelOverrides = classLevelOverrides;
+            this.methodLevelOverrides = methodLevelOverrides;
+        }
+
+        @Singleton
+        private static class OptionalConfigHolder {
+
+            @com.google.inject.Inject(optional = true)
+            @RuntimeLayer
+            private SettableConfig runtime;
+
+            public SettableConfig get() {
+                if (runtime != null) {
+                    return runtime;
+                } else {
+                    return new DefaultSettableConfig();
+                }
+            }
         }
 
         @Override
         protected void configure() {
-            bind(CompositeConfig.class).annotatedWith(Raw.class).toInstance(config);
+        }
+
+        @Provides
+        @Singleton
+        public TestCompositeConfig compositeConfig(OptionalConfigHolder config) {
+            return new TestCompositeConfig(config.get(), classLevelOverrides, methodLevelOverrides);
+        }
+
+        @Provides
+        @Singleton
+        @Raw
+        public CompositeConfig compositeConfig(TestCompositeConfig config) {
+            return config;
         }
     }
 }

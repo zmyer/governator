@@ -18,8 +18,10 @@ import com.google.inject.Injector;
 import com.google.inject.ProvisionException;
 import com.google.inject.matcher.Matchers;
 import com.google.inject.multibindings.Multibinder;
+import com.google.inject.multibindings.MultibindingsScanner;
 import com.google.inject.spi.ProvisionListener;
 import com.netflix.governator.annotations.SuppressLifecycleUninitialized;
+import com.netflix.governator.internal.BinaryConstant;
 import com.netflix.governator.internal.GovernatorFeatureSet;
 import com.netflix.governator.internal.JSR250LifecycleAction.ValidationMode;
 import com.netflix.governator.internal.PostConstructLifecycleFeature;
@@ -52,8 +54,6 @@ public final class LifecycleModule extends AbstractModule {
 
     /**
      * Holder of actions for a specific type.
-     * 
-     * @author elandau
      */
     static class TypeLifecycleActions {
         final List<LifecycleAction> postConstructActions = new ArrayList<LifecycleAction>();
@@ -63,7 +63,7 @@ public final class LifecycleModule extends AbstractModule {
     @Singleton
     @SuppressLifecycleUninitialized
     static class LifecycleProvisionListener extends AbstractLifecycleListener implements ProvisionListener {
-        private final ConcurrentMap<Class<?>, TypeLifecycleActions> cache = new ConcurrentHashMap<>();
+        private final ConcurrentMap<Class<?>, TypeLifecycleActions> cache = new ConcurrentHashMap<>(BinaryConstant.I12_4096);
         private Set<LifecycleFeature> features;
         private final AtomicBoolean isShutdown = new AtomicBoolean();
         private PostConstructLifecycleFeature postConstructFeature;
@@ -161,6 +161,12 @@ public final class LifecycleModule extends AbstractModule {
                 return;
             }
             
+            //Ignore for Spring-managed bindings
+            Object source = provision.getBinding().getSource();
+            if(source != null && source.toString().contains("spring-guice")) {
+                return;
+            }
+            
             final TypeLifecycleActions actions = getOrCreateActions(injectee.getClass());
             
             // Call all postConstructActions for this injectee
@@ -190,6 +196,8 @@ public final class LifecycleModule extends AbstractModule {
         bind(LifecycleProvisionListener.class).toInstance(provisionListener);
         bindListener(Matchers.any(), provisionListener);
         Multibinder.newSetBinder(binder(), LifecycleFeature.class);
+        
+        install(MultibindingsScanner.asModule());
     }
     
     @Override

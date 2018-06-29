@@ -11,12 +11,14 @@ import javax.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Preconditions;
 import com.google.inject.AbstractModule;
 import com.google.inject.Guice;
 import com.google.inject.Injector;
+import com.google.inject.Key;
 import com.google.inject.Module;
 import com.google.inject.Stage;
-import com.google.inject.TypeLiteral;
+import com.google.inject.multibindings.Multibinder;
 import com.netflix.governator.annotations.SuppressLifecycleUninitialized;
 import com.netflix.governator.annotations.binding.Arguments;
 import com.netflix.governator.annotations.binding.Profiles;
@@ -41,21 +43,25 @@ public class LifecycleInjectorCreator implements InjectorCreator<LifecycleInject
     private IdentityHashMap<GovernatorFeature<?>, Object> features = new IdentityHashMap<>();
     
     public LifecycleInjectorCreator withArguments(String[] args) {
+        Preconditions.checkArgument(args != null, "Arg may not be null");
         this.args = args;
         return this;
     }
     
     public LifecycleInjectorCreator withProfiles(String... profiles) {
+        Preconditions.checkArgument(profiles != null, "Arg may not be null");
         this.profiles = new LinkedHashSet<>(Arrays.asList(profiles));
         return this;
     }
     
     public LifecycleInjectorCreator withProfiles(Set<String> profiles) {
+        Preconditions.checkArgument(profiles != null, "profiles may not be null");
         this.profiles = new LinkedHashSet<>(profiles);
         return this;
     }
     
     public LifecycleInjectorCreator withFeatures(IdentityHashMap<GovernatorFeature<?>, Object> features) {
+        Preconditions.checkArgument(features != null, "features may not be null");
         this.features = features;
         return this;
     }
@@ -95,6 +101,7 @@ public class LifecycleInjectorCreator implements InjectorCreator<LifecycleInject
                 stage, 
                 // This has to be first to make sure @PostConstruct support is added as early
                 // as possible
+                new ProvisionMetricsModule(), 
                 new LifecycleModule(),
                 new LifecycleListenerModule(),
                 new LegacyScopesModule(),
@@ -103,7 +110,8 @@ public class LifecycleInjectorCreator implements InjectorCreator<LifecycleInject
                     protected void configure() {
                         bind(GovernatorFeatureSet.class).toInstance(featureSet);
                         bind(LifecycleManager.class).toInstance(manager);
-                        bind(new TypeLiteral<Set<String>>() {}).annotatedWith(Profiles.class).toInstance(profiles);
+                        Multibinder<String> profilesBinder = Multibinder.newSetBinder(binder(), Key.get(String.class, Profiles.class)).permitDuplicates();
+                        profiles.forEach(profile -> profilesBinder.addBinding().toInstance(profile));
                         bind(String[].class).annotatedWith(Arguments.class).toInstance(args);
                         requestInjection(LifecycleInjectorCreator.this);
                     }
@@ -113,6 +121,7 @@ public class LifecycleInjectorCreator implements InjectorCreator<LifecycleInject
             manager.notifyStarted();
             LifecycleInjector lifecycleInjector = LifecycleInjector.wrapInjector(injector, manager);
             onSuccessfulInjectorCreate();
+            LOG.info("Injector created successfully ");
             return lifecycleInjector;
         }
         catch (Exception e) {
